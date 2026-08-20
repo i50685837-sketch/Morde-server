@@ -1,0 +1,27 @@
+const axios = require("axios");
+
+const BOT_MANAGER_URL = process.env.BOT_MANAGER_URL || "http://localhost:8081";
+const INTERNAL_API_KEY = process.env.BOTNEST_INTERNAL_API_KEY;
+
+const client = axios.create({
+  baseURL: BOT_MANAGER_URL,
+  timeout: 15000,
+  headers: { "X-Internal-Api-Key": INTERNAL_API_KEY },
+});
+
+async function startBot({ botId, ownerId, sessionId }) {
+  const { data } = await client.post("/api/bots/start", { botId, ownerId, sessionId });
+  return data;
+}
+
+async function stopBot(botId) {
+  const { data } = await client.post(`/api/bots/${botId}/stop`);
+  return data;
+}
+
+async function getBotStatus(botId) {
+  const { data } = await client.get(`/api/bots/${botId}/status`);
+  return data;
+}
+
+module.exports = { startBot, stopBot, getBotStatus };
