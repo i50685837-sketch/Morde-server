@@ -1,0 +1,125 @@
+package com.botnest.manager.service;
+
+import com.botnest.manager.model.BotInstance;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Service
+public class DockerBotService {
+
+    // In-memory registry. Swap for Postgres/Mongo if this needs to survive
+    // restarts or scale across multiple manager instances.
+    private final Map<String, BotInstance> instances = new ConcurrentHashMap<>();
+
+    @Value("${botnest.bot-image:baileys-bot-runtime:latest}")
+    private String botImage;
+
+    @Value("${botnest.sessions-dir:/data/bot-sessions}")
+    private String sessionsDir;
+
+    public BotInstance start(String botId, String ownerId, String sessionId) {
+        if (instances.containsKey(botId) && instances.get(botId).getStatus() == BotInstance.Status.RUNNING) {
+            return instances.get(botId); // already running, idempotent
+        }
+
+        BotInstance instance = new BotInstance(botId, ownerId, sessionId);
+        instances.put(botId, instance);
+
+        try {
+            // One container per bot, session data persisted on a per-bot volume
+            // so a restart doesn't force the user to re-pair WhatsApp.
+            ProcessBuilder pb = new ProcessBuilder(
+                    "docker", "run", "-d",
+                    "--name", instance.getContainerName(),
+                    "--label", "managed-by=botnest",
+                    "--label", "owner-id=" + ownerId,
+                    "--memory=256m",
+                    "--cpus=0.5",
+                    "--restart=unless-stopped",
+                    "-v", sessionsDir + "/" + botId + ":/app/session",
+                    "-e", "SESSION_ID=" + sessionId,
+                    "-e", "BOT_ID=" + botId,
+                    botImage
+            );
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            String output = readOutput(process);
+            int exitCode = process.waitFor();
+
+            if (exitCode != 0) {
+                instance.setStatus(BotInstance.Status.FAILED);
+                instance.setLastError(output.trim());
+            } else {
+                instance.setStatus(BotInstance.Status.RUNNING);
+            }
+        } catch (Exception e) {
+            instance.setStatus(BotInstance.Status.FAILED);
+            instance.setLastError(e.getMessage());
+        }
+
+        return instance;
+    }
+
+    public BotInstance stop(String botId) {
+        BotInstance instance = instances.get(botId);
+        if (instance == null) return null;
+
+        try {
+            new ProcessBuilder("docker", "stop", instance.getContainerName())
+                    .redirectErrorStream(true).start().waitFor();
+            new ProcessBuilder("docker", "rm", instance.getContainerName())
+                    .redirectErrorStream(true).start().waitFor();
+
+            instance.setStatus(BotInstance.Status.STOPPED);
+            instance.setStoppedAt(java.time.Instant.now());
+        } catch (Exception e) {
+            instance.setLastError(e.getMessage());
+        }
+
+        return instance;
+    }
+
+    public BotInstance getStatus(String botId) {
+        BotInstance instance = instances.get(botId);
+        if (instance == null) return null;
+
+        // Reconcile against actual Docker state in case the container died
+        // outside our control (OOM kill, crash, etc).
+        if (instance.getStatus() == BotInstance.Status.RUNNING) {
+            try {
+                ProcessBuilder pb = new ProcessBuilder(
+                        "docker", "inspect", "-f", "{{.State.Running}}", instance.getContainerName());
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+                String output = readOutput(process).trim();
+                process.waitFor();
+
+                if (!"true".equals(output)) {
+                    instance.setStatus(BotInstance.Status.STOPPED);
+                }
+            } catch (Exception e) {
+                instance.setLastError(e.getMessage());
+            }
+        }
+
+        return instance;
+    }
+
+    public Map<String, BotInstance> listAll() {
+        return instances;
+    }
+
+    private String readOutput(Process process) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) sb.append(line).append("\n");
+        }
+        return sb.toString();
+    }
+}
